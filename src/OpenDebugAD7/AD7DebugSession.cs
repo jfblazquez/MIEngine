@@ -3008,6 +3008,23 @@ namespace OpenDebugAD7
                         isExecInConsole = true;
                 }
 
+                bool success = false;
+                if (frameId == -1 && isExecInConsole)
+                {
+                    // If exec in console and no stack frame, evaluate off the top frame.
+                    success = m_frameHandles.TryGetFirst(out _);
+                }
+                else
+                {
+                    success = m_frameHandles.TryGet(frameId, out _);
+                }
+
+                if (!success)
+                {
+                    responder.SetError(new ProtocolException(AD7Resources.Error_StackFrameNotFound));
+                    return;
+                }
+
                 ErrorBuilder eb = new ErrorBuilder(() => AD7Resources.Error_Scenario_Evaluate);
 
                 uint radix = GetRadixFromValueForamt(responder.Arguments.Format);
