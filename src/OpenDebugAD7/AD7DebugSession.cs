@@ -495,7 +495,7 @@ namespace OpenDebugAD7
             {
                 success = m_frameHandles.TryGet(frameId, out frame);
             }
-
+            
             if (!success)
             {
                 throw new ProtocolException(AD7Resources.Error_InvalidStackFrameOnEvaluateExpression);
@@ -2979,92 +2979,99 @@ namespace OpenDebugAD7
 
         protected override void HandleEvaluateRequestAsync(IRequestResponder<EvaluateArguments, EvaluateResponse> responder)
         {
-            EvaluateArguments.ContextValue context = responder.Arguments.Context.GetValueOrDefault(EvaluateArguments.ContextValue.Unknown);
-            int frameId = responder.Arguments.FrameId.GetValueOrDefault(-1);
-            string expression = responder.Arguments.Expression;
-
-            if (expression == null)
+            try
             {
-                responder.SetError(new ProtocolException("Failed to handle EvaluateRequest: Missing 'expression'"));
-                return;
+                EvaluateArguments.ContextValue context = responder.Arguments.Context.GetValueOrDefault(EvaluateArguments.ContextValue.Unknown);
+                int frameId = responder.Arguments.FrameId.GetValueOrDefault(-1);
+                string expression = responder.Arguments.Expression;
+
+                if (expression == null)
+                {
+                    responder.SetError(new ProtocolException("Failed to handle EvaluateRequest: Missing 'expression'"));
+                    return;
+                }
+
+                // if we are not stopped, return evaluation failure
+                if (!m_isStopped)
+                {
+                    responder.SetError(new ProtocolException("Failed to handle EvaluateRequest", new Message(1105, AD7Resources.Error_TargetNotStopped)));
+                    return;
+                }
+                DateTime evaluationStartTime = DateTime.Now;
+
+                bool isExecInConsole = false;
+                // If the expression isn't empty and its a Repl request, do additional checking
+                if (!String.IsNullOrEmpty(expression) && context == EvaluateArguments.ContextValue.Repl)
+                {
+                    // If this is an -exec command (or starts with '`') treat it as a console command and log telemetry
+                    if (expression.StartsWith("-exec", StringComparison.Ordinal) || expression[0] == '`')
+                        isExecInConsole = true;
+                }
+
+                ErrorBuilder eb = new ErrorBuilder(() => AD7Resources.Error_Scenario_Evaluate);
+
+                uint radix = GetRadixFromValueForamt(responder.Arguments.Format);
+
+                // NOTE: This is the same as what vssdebug normally passes for the watch window
+                enum_EVALFLAGS flags = enum_EVALFLAGS.EVAL_RETURNVALUE |
+                    enum_EVALFLAGS.EVAL_NOEVENTS |
+                    (enum_EVALFLAGS)enum_EVALFLAGS110.EVAL110_FORCE_REAL_FUNCEVAL;
+
+                if (context == EvaluateArguments.ContextValue.Hover) // No side effects for data tips
+                {
+                    flags |= enum_EVALFLAGS.EVAL_NOSIDEEFFECTS;
+                }
+
+                DAPEvalFlags dapEvalFlags = DAPEvalFlags.NONE;
+                if (context == EvaluateArguments.ContextValue.Clipboard)
+                {
+                    dapEvalFlags |= DAPEvalFlags.CLIPBOARD_CONTEXT;
+                }
+
+                DEBUG_PROPERTY_INFO[] propertyInfo = new DEBUG_PROPERTY_INFO[1];
+                enum_DEBUGPROP_INFO_FLAGS propertyInfoFlags = GetDefaultPropertyInfoFlags();
+
+                if (context == EvaluateArguments.ContextValue.Hover) // No side effects for data tips
+                {
+                    propertyInfoFlags |= (enum_DEBUGPROP_INFO_FLAGS)enum_DEBUGPROP_INFO_FLAGS110.DEBUGPROP110_INFO_NOSIDEEFFECTS;
+                }
+
+                GetDebugPropertyFromExpression(eb, expression, frameId, isExecInConsole, flags, dapEvalFlags, out IDebugProperty2 property);
+
+                property.GetPropertyInfo(propertyInfoFlags, radix, Constants.EvaluationTimeout, null, 0, propertyInfo);
+
+                // If the expression evaluation produces an error result and we are trying to get the expression for data tips
+                // return a failure result so that VS code won't display the error message in data tips
+                if (((propertyInfo[0].dwAttrib & enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR) == enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR) && context == EvaluateArguments.ContextValue.Hover)
+                {
+                    responder.SetError(new ProtocolException("Evaluation error"));
+                    return;
+                }
+
+                string memoryReference = AD7Utils.GetMemoryReferenceFromIDebugProperty(property);
+
+                Variable variable = m_variableManager.CreateVariable(ref propertyInfo[0], propertyInfoFlags, memoryReference);
+
+                if (context != EvaluateArguments.ContextValue.Hover)
+                {
+                    DebuggerTelemetry.ReportEvaluation(
+                        ((propertyInfo[0].dwAttrib & enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR) == enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR),
+                        DateTime.Now - evaluationStartTime,
+                        isExecInConsole ? new Dictionary<string, object>() { { DebuggerTelemetry.TelemetryExecuteInConsole, true } } : null);
+                }
+
+                responder.SetResponse(new EvaluateResponse()
+                {
+                    Result = variable.Value,
+                    Type = variable.Type,
+                    VariablesReference = variable.VariablesReference,
+                    MemoryReference = memoryReference
+                });
             }
-
-            // if we are not stopped, return evaluation failure
-            if (!m_isStopped)
+            catch (Exception e)
             {
-                responder.SetError(new ProtocolException("Failed to handle EvaluateRequest", new Message(1105, AD7Resources.Error_TargetNotStopped)));
-                return;
+                responder.SetError(new ProtocolException(e.Message));
             }
-            DateTime evaluationStartTime = DateTime.Now;
-
-            bool isExecInConsole = false;
-            // If the expression isn't empty and its a Repl request, do additional checking
-            if (!String.IsNullOrEmpty(expression) && context == EvaluateArguments.ContextValue.Repl)
-            {
-                // If this is an -exec command (or starts with '`') treat it as a console command and log telemetry
-                if (expression.StartsWith("-exec", StringComparison.Ordinal) || expression[0] == '`')
-                    isExecInConsole = true;
-            }
-
-            ErrorBuilder eb = new ErrorBuilder(() => AD7Resources.Error_Scenario_Evaluate);
-
-            uint radix = GetRadixFromValueForamt(responder.Arguments.Format);
-
-            // NOTE: This is the same as what vssdebug normally passes for the watch window
-            enum_EVALFLAGS flags = enum_EVALFLAGS.EVAL_RETURNVALUE |
-                enum_EVALFLAGS.EVAL_NOEVENTS |
-                (enum_EVALFLAGS)enum_EVALFLAGS110.EVAL110_FORCE_REAL_FUNCEVAL;
-
-            if (context == EvaluateArguments.ContextValue.Hover) // No side effects for data tips
-            {
-                flags |= enum_EVALFLAGS.EVAL_NOSIDEEFFECTS;
-            }
-
-            DAPEvalFlags dapEvalFlags = DAPEvalFlags.NONE;
-            if (context == EvaluateArguments.ContextValue.Clipboard)
-            {
-                dapEvalFlags |= DAPEvalFlags.CLIPBOARD_CONTEXT;
-            }
-
-            DEBUG_PROPERTY_INFO[] propertyInfo = new DEBUG_PROPERTY_INFO[1];
-            enum_DEBUGPROP_INFO_FLAGS propertyInfoFlags = GetDefaultPropertyInfoFlags();
-
-            if (context == EvaluateArguments.ContextValue.Hover) // No side effects for data tips
-            {
-                propertyInfoFlags |= (enum_DEBUGPROP_INFO_FLAGS)enum_DEBUGPROP_INFO_FLAGS110.DEBUGPROP110_INFO_NOSIDEEFFECTS;
-            }
-
-            GetDebugPropertyFromExpression(eb, expression, frameId, isExecInConsole, flags, dapEvalFlags, out IDebugProperty2 property);
-
-            property.GetPropertyInfo(propertyInfoFlags, radix, Constants.EvaluationTimeout, null, 0, propertyInfo);
-
-            // If the expression evaluation produces an error result and we are trying to get the expression for data tips
-            // return a failure result so that VS code won't display the error message in data tips
-            if (((propertyInfo[0].dwAttrib & enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR) == enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR) && context == EvaluateArguments.ContextValue.Hover)
-            {
-                responder.SetError(new ProtocolException("Evaluation error"));
-                return;
-            }
-
-            string memoryReference = AD7Utils.GetMemoryReferenceFromIDebugProperty(property);
-
-            Variable variable = m_variableManager.CreateVariable(ref propertyInfo[0], propertyInfoFlags, memoryReference);
-
-            if (context != EvaluateArguments.ContextValue.Hover)
-            {
-                DebuggerTelemetry.ReportEvaluation(
-                    ((propertyInfo[0].dwAttrib & enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR) == enum_DBG_ATTRIB_FLAGS.DBG_ATTRIB_VALUE_ERROR),
-                    DateTime.Now - evaluationStartTime,
-                    isExecInConsole ? new Dictionary<string, object>() { { DebuggerTelemetry.TelemetryExecuteInConsole, true } } : null);
-            }
-
-            responder.SetResponse(new EvaluateResponse()
-            {
-                Result = variable.Value,
-                Type = variable.Type,
-                VariablesReference = variable.VariablesReference,
-                MemoryReference = memoryReference
-            });
         }
 
         protected override void HandleReadMemoryRequestAsync(IRequestResponder<ReadMemoryArguments, ReadMemoryResponse> responder)
